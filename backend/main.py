@@ -12,45 +12,41 @@ from sqlalchemy.dialects.postgresql import insert
 
 app = FastAPI(title="JJM Cloud Backend")
 
-# --- CORS: ALLOW FRONTEND TO CONNECT ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to your Vercel Domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- 1. SERVE STATIC FILES (REPLACES MOCK SERVER) ---
-# This serves your CSVs directly from the backend
+# --- 1. SERVE STATIC FILES ---
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# --- 2. DATABASE CONFIGURATION (CLOUD + LOCAL FALLBACK) ---
-# Looks for Render's DB URL, else uses your local default
+# --- 2. DATABASE CONFIGURATION ---
 DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:india4156@localhost/jjm_db")
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(DB_URL)
 
-# --- 3. DYNAMIC GOVT API URLs ---
-# In Cloud, points to https://your-app.onrender.com. Locally, http://127.0.0.1:8000
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "http://127.0.0.1:8000")
-GOVT_API_URLS = {
-    "imis_tap": f"{BASE_URL}/static/raw_imis_tap_water_status.csv",
-    "imis_schemes": f"{BASE_URL}/static/raw_imis_scheme_master.csv",
-    "zp": f"{BASE_URL}/static/raw_zp_scheme_progress.csv",
-    "mjp": f"{BASE_URL}/static/raw_mjp_financial_report.csv",
-    "gsda": f"{BASE_URL}/static/raw_gsda_water_quality.csv",
-    "pgrs": f"{BASE_URL}/static/raw_pgrs_grievance.csv"
-}
-
-# --- CONFIGURATION ---
+# --- 3. CONFIGURATION ---
 STATE_MAPPING = {
     "A & N Islands": "Andaman & Nicobar Islands",
     "Andaman & Nicobar Islands": "Andaman & Nicobar Islands",
     "Maharashtra": "Maharashtra"
+}
+
+# FILE MAPPING (Local filenames)
+# We map keys directly to filenames now, to avoid network calls
+RAW_FILES = {
+    "imis_tap": "raw_imis_tap_water_status.csv",
+    "imis_schemes": "raw_imis_scheme_master.csv",
+    "zp": "raw_zp_scheme_progress.csv",
+    "mjp": "raw_mjp_financial_report.csv",
+    "gsda": "raw_gsda_water_quality.csv",
+    "pgrs": "raw_pgrs_grievance.csv"
 }
 
 # --- UTILS ---
@@ -62,32 +58,28 @@ def clean_financials(row):
     if lakhs > 1000 and act < 1000: return lakhs, act 
     return act, lakhs
 
-# --- DATABASE HELPERS (SQLAlchemy 2.0 Robust) ---
+# --- DATABASE HELPERS ---
 def ensure_primary_key(table_name, pk_column):
-    """Forces Primary Key constraint on PostgreSQL table"""
     try:
         with engine.connect() as conn:
             check_sql = text(f"SELECT constraint_name FROM information_schema.table_constraints WHERE table_name = '{table_name}' AND constraint_type = 'PRIMARY KEY'")
             if not conn.execute(check_sql).fetchone():
                 conn.execute(text(f'ALTER TABLE "{table_name}" ADD PRIMARY KEY ("{pk_column}")'))
                 conn.commit()
-    except Exception as e: print(f"PK Warning for {table_name}: {e}")
+    except Exception as e: print(f"PK Warning: {e}")
 
 def perform_upsert(df, table_name, primary_key):
-    """Upserts Dataframe to Postgres"""
     if df.empty: return
     ensure_primary_key(table_name, primary_key)
     metadata = MetaData()
     try:
         target_table = Table(table_name, metadata, autoload_with=engine)
-    except: return 
+    except: return
 
     with engine.connect() as conn:
         data = df.to_dict(orient='records')
         stmt = insert(target_table).values(data)
-        # Exclude PK from update
         update_cols = {col.name: stmt.excluded[col.name] for col in target_table.c if col.name != primary_key}
-        
         if update_cols:
             on_conflict_stmt = stmt.on_conflict_do_update(index_elements=[primary_key], set_=update_cols)
             conn.execute(on_conflict_stmt)
@@ -95,7 +87,7 @@ def perform_upsert(df, table_name, primary_key):
             conn.execute(stmt.on_conflict_do_nothing(index_elements=[primary_key]))
         conn.commit()
 
-# --- CORE PIPELINE (ROBUST UNIVERSAL LOGIC) ---
+# --- CORE PIPELINE ---
 def run_etl_pipeline(dfs):
     anomalies = []
 
@@ -141,18 +133,13 @@ def run_etl_pipeline(dfs):
                     anomalies.append({"Scheme_ID": row['Ticket_ID'], "Issue_Type": "Logical Data Error", "Severity": "Low", "Description": "Ticket Resolved before Reported."})
             except: pass
 
-    # 2. REPO GENERATION (UNIVERSAL MERGE)
+    # 2. REPO GENERATION
     src_imis = df_imis[['Scheme_ID', 'District', 'Scheme_Name', 'Status', 'Completion_Date']].copy()
-    
     src_zp = pd.DataFrame()
-    if 'zp' in dfs: 
-        src_zp = dfs['zp'][['Scheme_ID', 'District', 'Physical_Progress', 'Financial_Progress', 'Last_Updated']].copy()
-    
+    if 'zp' in dfs: src_zp = dfs['zp'][['Scheme_ID', 'District', 'Physical_Progress', 'Financial_Progress', 'Last_Updated']].copy()
     src_mjp = pd.DataFrame()
-    if 'mjp' in dfs: 
-        src_mjp = df_mjp.groupby(['Scheme_ID', 'District'])['Cleaned_Expenditure_INR'].sum().reset_index()
+    if 'mjp' in dfs: src_mjp = df_mjp.groupby(['Scheme_ID', 'District'])['Cleaned_Expenditure_INR'].sum().reset_index()
 
-    # The Universal Outer Join
     unified = src_imis.copy()
     if not src_zp.empty:
         unified = pd.merge(unified, src_zp, on='Scheme_ID', how='outer', suffixes=('', '_ZP'))
@@ -164,18 +151,15 @@ def run_etl_pipeline(dfs):
             unified['District'] = unified['District'].fillna(unified['District_MJP'])
             unified.drop(columns=['District_MJP'], inplace=True)
 
-    # Clean Values
     for c in ['Physical_Progress', 'Financial_Progress', 'Cleaned_Expenditure_INR']:
         if c in unified.columns: unified[c] = unified[c].fillna(0)
     for c in ['Scheme_Name', 'Status', 'Completion_Date', 'Last_Updated', 'District']:
         if c in unified.columns: unified[c] = unified[c].fillna("-")
 
-    # Status Inference Logic (Matches Screenshots)
     def determine_status(row):
         status = str(row.get('Status', '-')).lower()
         phy = row.get('Physical_Progress', 0)
         fin_mjp = row.get('Cleaned_Expenditure_INR', 0)
-        
         if status == 'completed' and phy == 0: return "DATA CONFLICT"
         if status == '-' or status == 'nan':
             if phy > 90: return "Completed (ZP)"
@@ -188,7 +172,6 @@ def run_etl_pipeline(dfs):
     unified['Scheme_Name'] = unified.apply(lambda r: f"Scheme {r['Scheme_ID']}" if r['Scheme_Name'] in ['-', 'nan', ''] else r['Scheme_Name'], axis=1)
     unified_schemes = unified
 
-    # Districts Logic
     unique_districts = pd.DataFrame(unified_schemes['District'].unique(), columns=['District_Name'])
     unique_districts = unique_districts[unique_districts['District_Name'] != '-']
     
@@ -212,7 +195,6 @@ def run_etl_pipeline(dfs):
     def calc_rate(row): return round((row['Contaminated_Samples'] / row['Samples_Tested']) * 100, 2) if row['Samples_Tested'] > 0 else 0.0
     unified_districts['Contamination_Rate'] = unified_districts.apply(calc_rate, axis=1)
 
-    # Master Logic
     repo_2_join = unified_districts.rename(columns={'District_Name': 'District'})
     unified_master = pd.merge(unified_schemes, repo_2_join, on='District', how='left')
     unified_master = unified_master.replace({np.nan: 0, '': '-'})
@@ -246,15 +228,21 @@ async def standardize_data(files: List[UploadFile] = File(...)):
 
 @app.post("/fetch-from-api")
 async def fetch_data_from_api():
-    print("Initiating API Fetch...")
+    print("Initiating Local API Read...")
     dfs = {}
-    for key, url in GOVT_API_URLS.items():
+    
+    # NEW LOGIC: READ FILES FROM DISK (NO NETWORK CALLS)
+    for key, filename in RAW_FILES.items():
+        file_path = os.path.join("static", filename)
         try:
-            response = requests.get(url)
-            response.raise_for_status()
-            dfs[key] = pd.read_csv(io.BytesIO(response.content))
-        except Exception as e: print(f"Failed to fetch {key}: {e}")
-    if 'imis_schemes' not in dfs: raise HTTPException(status_code=502, detail="Failed to fetch Critical Data")
+            if os.path.exists(file_path):
+                dfs[key] = pd.read_csv(file_path)
+            else:
+                print(f"Warning: File {filename} not found locally.")
+        except Exception as e: 
+            print(f"Failed to read {key}: {e}")
+
+    if 'imis_schemes' not in dfs: raise HTTPException(status_code=502, detail="Critical Data Missing on Server")
     return run_etl_pipeline(dfs)
 
 @app.post("/save-to-db")
